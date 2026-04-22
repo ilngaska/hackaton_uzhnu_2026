@@ -24,7 +24,6 @@
 #include "lib_common_types.h"
 #include "lib_buzzer.h"
 #include "lib_servo.h"
-#include <stdlib.h>
 #include <stdio.h>
 
 #define LOG_LEVEL LOG_LEVEL_DBG
@@ -42,13 +41,11 @@
 #define RFID_LCD_UPDATE_TICKS       (RFID_LCD_UPDATE_INTERVAL_MS / LOOP_DELAY_MS)
 #define RFID_NO_TAG_READS           (500u / RFID_LCD_UPDATE_INTERVAL_MS)
 #define SENSOR_SHOW_DELAY_TICKS     (1200u / LOOP_DELAY_MS)
-#define CORRECT_PASSWORD            "1234"
 #define LDR_DARK_THRESHOLD          (400)
 #define TILT_THRESHOLD_MG           (600)
 
 typedef enum {
     STATE_IDLE,
-    STATE_PASSWORD_ENTRY,
     STATE_SHADOW_MODE,
     STATE_KINETIC_KEY,
     STATE_OPENED
@@ -77,8 +74,6 @@ static int16_t  g_last_imu_temp = 0;
 static int16_t  g_last_mag_temp = 0;
 
 static safe_state_t g_safe_state = STATE_IDLE;
-static char g_input_password[5] = "";
-static uint8_t g_pass_idx = 0;
 static uint8_t g_kinetic_step = 0;
 
 /********************************************************************************
@@ -161,59 +156,6 @@ static void app_key_0_action()
     LED_BLUE_Write(1u);
     LOG_I(TAG, "KEY 0: RGB LED pattern done");
     app_show_default_lcd_splash();
-}
-static void app_set_led_color(uint8_t r, uint8_t g, uint8_t b)
-{
-    LED_RED_Write(!r);   // Якщо 1 - горить, 0 - ні, то прибери знак '!'
-    LED_GREEN_Write(!g);
-    LED_BLUE_Write(!b);
-}
-
-static void app_handle_error(const char *msg)
-{
-    LOG_E(TAG, "Error: %s", msg);
-    app_lcd_show("ERROR!", msg);
-    
-    for(uint8_t i = 0; i < 3; i++) {
-        app_set_led_color(1, 0, 0);
-        lib_buzzer_play_melody(); 
-        CyDelay(200);
-        app_set_led_color(0, 0, 0); 
-        CyDelay(200);
-    }
-    
-    g_safe_state = STATE_IDLE;
-    g_pass_idx = 0;
-    g_kinetic_step = 0;
-    memset(g_input_password, 0, sizeof(g_input_password));
-    app_show_default_lcd_splash();
-}
-
-static void app_handle_password_input(lib_mkb_key_t key)
-{
-    if (g_safe_state != STATE_PASSWORD_ENTRY) return;
-
-    if (key <= LIB_MKB_KEY_9 && g_pass_idx < 4) {
-        g_input_password[g_pass_idx++] = (char)('0' + key);
-        g_input_password[g_pass_idx] = '\0';
-        
-        char stars[5] = "";
-        for(int i=0; i<g_pass_idx; i++) stars[i] = '*';
-        
-        app_lcd_show("ENTER PIN:", stars);
-        lib_buzzer_play_melody(); 
-
-        if (g_pass_idx == 4) {
-            CyDelay(500);
-            if (strcmp(g_input_password, CORRECT_PASSWORD) == 0) {
-                app_lcd_show("PIN CORRECT", "TILT PANEL...");
-                app_set_led_color(1, 1, 0); // Жовтий
-                g_safe_state = STATE_SHADOW_MODE;
-            } else {
-                app_handle_error("WRONG PIN");
-            }
-        }
-    }
 }
 
 static void app_key_1_action()
@@ -435,34 +377,7 @@ static void app_deactivate_all_live_modes(void)
 
 static void app_execute_key_action(lib_mkb_key_t key, uint8_t digits[8])
 {
-    /* * ПРІОРИТЕТ: Перевірка пароля.
-     * Якщо сейф чекає на введення коду, цифри не повинні активувати інші режими.
-     */
-    if (g_safe_state == STATE_PASSWORD_ENTRY)
-    {
-        // Обробляємо натискання цифр 0-9 як частину пароля
-        if (key >= LIB_MKB_KEY_0 && key <= LIB_MKB_KEY_9)
-        {
-            app_handle_password_input(key);
-            return; 
-        }
-        
-        // Дозволяємо '#' скинути ввід пароля, якщо помилився
-        if (key == LIB_MKB_KEY_HASH)
-        {
-            g_pass_idx = 0;
-            memset(g_input_password, 0, sizeof(g_input_password));
-            app_lcd_show("ENTER PIN:", "");
-            lib_buzzer_play_melody();
-            return;
-        }
-    }
-
-    /* * ЗВИЧАЙНА ЛОГІКА:
-     * Якщо ми не в режимі пароля, працює твій стандартний switch.
-     */
     app_deactivate_all_live_modes();
-
     switch (key)
     {
         case LIB_MKB_KEY_0:
@@ -493,19 +408,10 @@ static void app_execute_key_action(lib_mkb_key_t key, uint8_t digits[8])
             app_key_8_action(digits);
             break;
         case LIB_MKB_KEY_9:
-            // Кнопка 9 запускає RFID режим, який потім переведе нас у PASSWORD_ENTRY
             app_key_9_action();
             break;
         case LIB_MKB_KEY_STAR:
-            if (g_safe_state == STATE_OPENED)
-            {
-                app_key_star_action();
-            }
-            else
-            {
-                app_lcd_show("LOCKED", "Follow all steps");
-                lib_buzzer_play_melody();
-            }
+            app_key_star_action();
             break;
         case LIB_MKB_KEY_HASH:
             app_key_hash_action();
@@ -794,53 +700,35 @@ static void app_process_runtime_modes(const lib_acc_gyr_data_t *acc_gyr_data,
 
 static void app_process_safe_logic(const lib_acc_gyr_data_t *imu)
 {
-    int16_t light = lib_adc_get(ADC_CH_POT_2_0);
-    uint8_t btn_pressed = (BTN_SW_Read() == 0u);
+    int16_t light = lib_adc_get(ADC_CH_POT_2_0); 
+    uint8_t btn_pressed = (BTN_SW_Read() == 0u); 
 
     switch(g_safe_state) {
         case STATE_IDLE:
-            app_set_led_color(0, 0, 1);
             if (g_key9_live_rfid_mode && g_key9_has_tag) {
-                g_safe_state = STATE_PASSWORD_ENTRY;
-                app_lcd_show("ID OK", "ENTER PIN:");
+                g_safe_state = STATE_SHADOW_MODE;
+                app_lcd_show("RFID OK!", "COVER LDR & BTN");
             }
             break;
 
-        case STATE_PASSWORD_ENTRY:
-            
-            break;
-
         case STATE_SHADOW_MODE:
-            if (btn_pressed) {
-                if (light < LDR_DARK_THRESHOLD) {
-                    lib_buzzer_play_melody();
-                    g_safe_state = STATE_KINETIC_KEY;
-                    g_kinetic_step = 0;
-                    app_lcd_show("SHADOW OK", "TILT FORWARD");
-                } else {
-                    app_handle_error("TOO BRIGHT!");
-                }
+            if (light < LDR_DARK_THRESHOLD && btn_pressed) {
+                lib_buzzer_play_melody();
+                g_safe_state = STATE_KINETIC_KEY;
+                g_kinetic_step = 0;
+                app_lcd_show("SHADOW OK", "TILT FORWARD");
             }
             break;
 
         case STATE_KINETIC_KEY:
-            if (g_kinetic_step == 0) { 
-                if (imu->acc.x > TILT_THRESHOLD_MG) {
-                    g_kinetic_step = 1;
-                    lib_buzzer_play_melody();
-                    app_lcd_show("STEP 1 OK", "TILT LEFT");
-                } else if (abs(imu->acc.y) > TILT_THRESHOLD_MG) {
-                    app_handle_error("WRONG TILT");
-                }
+            if (g_kinetic_step == 0 && imu->acc.x > TILT_THRESHOLD_MG) {
+                g_kinetic_step = 1;
+                lib_buzzer_play_melody();
+                app_lcd_show("TILT 1 OK", "TILT LEFT");
             } 
-            else if (g_kinetic_step == 1) { 
-                if (imu->acc.y < -TILT_THRESHOLD_MG) {
-                    g_safe_state = STATE_OPENED;
-                    app_set_led_color(0, 1, 0);
-                    app_lcd_show("KINETIC OK", "PRESS * TO OPEN");
-                } else if (imu->acc.x < -TILT_THRESHOLD_MG) {
-                    app_handle_error("WRONG TILT");
-                }
+            else if (g_kinetic_step == 1 && imu->acc.y < -TILT_THRESHOLD_MG) {
+                g_safe_state = STATE_OPENED;
+                app_lcd_show("KINETIC OK", "PRESS * TO OPEN");
             }
             break;
 
